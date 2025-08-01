@@ -2,7 +2,7 @@ pipeline {
     agent any
 
     environment {
-        JIRA_BASE_URL = 'https://pradeepanaveensabares.atlassian.net/'
+        JIRA_BASE_URL = 'https://pradeepanaveensabares.atlassian.net'
         JIRA_ISSUE_KEY = '' // Dynamically extracted later
     }
 
@@ -11,14 +11,19 @@ pipeline {
         stage('Extract Jira Issue Key') {
             steps {
                 script {
-                    // Attempt to extract JIRA key from last commit message
+                    // Ensure full history is available
+                    sh "git fetch --unshallow || true"
+
                     def commitMessage = sh(script: "git log -1 --pretty=%B", returnStdout: true).trim()
-                    def match = commitMessage =~ /(PROJ|JIRA|QA|DEV)-\d+/
+                    echo "Commit Message: ${commitMessage}"
+
+                    // Adjust pattern for KAN project only
+                    def match = commitMessage =~ /(KAN-\d+)/
                     if (match) {
                         env.JIRA_ISSUE_KEY = match[0]
                         echo "Jira Issue Key detected: ${env.JIRA_ISSUE_KEY}"
                     } else {
-                        error "No Jira issue key found in commit message. Expected format like PROJ-123"
+                        error "No Jira issue key found in commit message. Expected format like KAN-123"
                     }
                 }
             }
@@ -31,7 +36,7 @@ pipeline {
                     echo "Current status: ${currentStatus}"
 
                     if (currentStatus == "To Do") {
-                        updateJiraStatus(env.JIRA_ISSUE_KEY, "Start Progress")
+                        updateJiraStatus(env.JIRA_ISSUE_KEY, "start progress")
                         echo "Transitioned to 'In Progress'"
                     } else if (currentStatus != "In Progress") {
                         error "Jira issue not in a valid state to proceed: ${currentStatus}"
@@ -54,13 +59,15 @@ pipeline {
                     if (currentBuild.currentResult == 'SUCCESS') {
                         updateJiraStatus(env.JIRA_ISSUE_KEY, "Mark as Done")
                     } else {
-                        updateJiraStatus(env.JIRA_ISSUE_KEY, "Inputs Needed") // Blocked flow
+                        updateJiraStatus(env.JIRA_ISSUE_KEY, "Inputs needed")
                     }
                 }
             }
         }
     }
 }
+
+// === Helper Functions ===
 
 def getJiraStatus(issueKey) {
     withCredentials([usernamePassword(credentialsId: 'jira_credentials', usernameVariable: 'JIRA_USER', passwordVariable: 'JIRA_TOKEN')]) {
@@ -89,7 +96,7 @@ def updateJiraStatus(issueKey, targetTransitionName) {
             ],
             validResponseCodes: '200'
         )
-        
+
         def transitions = readJSON text: transitionsResponse.content
         def transitionId = transitions.transitions.find { it.name == targetTransitionName }?.id
 
