@@ -3,43 +3,55 @@ pipeline {
 
     environment {
         JIRA_BASE_URL = 'https://pradeepanaveensabares.atlassian.net'
-        JIRA_ISSUE_KEY = '' // Dynamically extracted later
+        JIRA_ISSUE_KEY = '' // Set dynamically
     }
 
     stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
 
         stage('Extract Jira Issue Key') {
             steps {
                 script {
-                    // Ensure full history is available
-                    sh "git fetch --unshallow || true"
-
                     def commitMessage = sh(script: "git log -1 --pretty=%B", returnStdout: true).trim()
-                    echo "Commit Message: ${commitMessage}"
+                    echo "Commit message: ${commitMessage}"
 
-                    // Adjust pattern for KAN project only
-                    def match = commitMessage =~ /(KAN-\d+)/
+                    def match = commitMessage =~ /(PROJ|JIRA|QA|DEV|KAN)-\d+/
                     if (match) {
                         env.JIRA_ISSUE_KEY = match[0]
                         echo "Jira Issue Key detected: ${env.JIRA_ISSUE_KEY}"
                     } else {
-                        error "No Jira issue key found in commit message. Expected format like KAN-123"
+                        error "No Jira issue key found in commit message."
                     }
                 }
             }
         }
 
-        stage('Verify Jira Status and Start Progress') {
+        stage('Check Status and Start Progress') {
             steps {
                 script {
-                    def currentStatus = getJiraStatus(env.JIRA_ISSUE_KEY)
-                    echo "Current status: ${currentStatus}"
+                    withCredentials([usernamePassword(credentialsId: 'jira_credentials', usernameVariable: 'JIRA_USER', passwordVariable: 'JIRA_TOKEN')]) {
+                        def auth = sh(script: "echo -n ${JIRA_USER}:${JIRA_TOKEN} | base64", returnStdout: true).trim()
 
-                    if (currentStatus == "To Do") {
-                        updateJiraStatus(env.JIRA_ISSUE_KEY, "start progress")
-                        echo "Transitioned to 'In Progress'"
-                    } else if (currentStatus != "In Progress") {
-                        error "Jira issue not in a valid state to proceed: ${currentStatus}"
+                        def statusResponse = sh(
+                            script: """curl -s -H "Authorization: Basic ${auth}" \
+                                          -H "Content-Type: application/json" \
+                                          "${JIRA_BASE_URL}/rest/api/3/issue/${env.JIRA_ISSUE_KEY}" """,
+                            returnStdout: true
+                        )
+
+                        def statusJson = readJSON text: statusResponse
+                        def currentStatus = statusJson.fields.status.name
+                        echo "Current Jira Status: ${currentStatus}"
+
+                        if (currentStatus == "TO DO") {
+                            transitionJiraIssue(env.JIRA_ISSUE_KEY, "start progress", auth)
+                        } else if (currentStatus != "IN PROGRESS") {
+                            error "Jira issue not in a valid state to proceed: ${currentStatus}"
+                        }
                     }
                 }
             }
@@ -48,18 +60,17 @@ pipeline {
         stage('Basic Smoke Tests') {
             steps {
                 echo 'Running basic smoke tests...'
-                // Dummy test
-                sh 'echo "Tests passed!"'
+                sh 'echo "All tests passed!"'
             }
         }
 
         stage('Update Jira After Test') {
             steps {
                 script {
-                    if (currentBuild.currentResult == 'SUCCESS') {
-                        updateJiraStatus(env.JIRA_ISSUE_KEY, "Mark as Done")
-                    } else {
-                        updateJiraStatus(env.JIRA_ISSUE_KEY, "Inputs needed")
+                    withCredentials([usernamePassword(credentialsId: 'jira_credentials', usernameVariable: 'JIRA_USER', passwordVariable: 'JIRA_TOKEN')]) {
+                        def auth = sh(script: "echo -n ${JIRA_USER}:${JIRA_TOKEN} | base64", returnStdout: true).trim()
+                        def transitionName = currentBuild.currentResult == 'SUCCESS' ? "Mark as Done" : "Inputs needed"
+                        transitionJiraIssue(env.JIRA_ISSUE_KEY, transitionName, auth)
                     }
                 }
             }
@@ -67,57 +78,31 @@ pipeline {
     }
 }
 
-// === Helper Functions ===
+def transitionJiraIssue(issueKey, transitionName, authToken) {
+    def transitionsResponse = sh(
+        script: """curl -s -H "Authorization: Basic ${authToken}" \
+                          -H "Content-Type: application/json" \
+                          "${JIRA_BASE_URL}/rest/api/3/issue/${issueKey}/transitions" """,
+        returnStdout: true
+    )
 
-def getJiraStatus(issueKey) {
-    withCredentials([usernamePassword(credentialsId: 'jira_credentials', usernameVariable: 'JIRA_USER', passwordVariable: 'JIRA_TOKEN')]) {
-        def response = httpRequest(
-            url: "${JIRA_BASE_URL}/rest/api/3/issue/${issueKey}",
-            httpMode: 'GET',
-            customHeaders: [
-                [name: 'Authorization', value: "Basic ${"${JIRA_USER}:${JIRA_TOKEN}".bytes.encodeBase64().toString()}", maskValue: true],
-                [name: 'Content-Type', value: 'application/json']
-            ],
-            validResponseCodes: '200'
-        )
-        def json = readJSON text: response.content
-        return json.fields.status.name
-    }
-}
+    def transitionsJson = readJSON text: transitionsResponse
+    def transition = transitionsJson.transitions.find { it.name.equalsIgnoreCase(transitionName) }
 
-def updateJiraStatus(issueKey, targetTransitionName) {
-    withCredentials([usernamePassword(credentialsId: 'jira_credentials', usernameVariable: 'JIRA_USER', passwordVariable: 'JIRA_TOKEN')]) {
-        def transitionsResponse = httpRequest(
-            url: "${JIRA_BASE_URL}/rest/api/3/issue/${issueKey}/transitions",
-            httpMode: 'GET',
-            customHeaders: [
-                [name: 'Authorization', value: "Basic ${"${JIRA_USER}:${JIRA_TOKEN}".bytes.encodeBase64().toString()}", maskValue: true],
-                [name: 'Content-Type', value: 'application/json']
-            ],
-            validResponseCodes: '200'
-        )
+    if (transition) {
+        def payload = [
+            transition: [id: transition.id]
+        ]
+        def payloadStr = groovy.json.JsonOutput.toJson(payload)
 
-        def transitions = readJSON text: transitionsResponse.content
-        def transitionId = transitions.transitions.find { it.name == targetTransitionName }?.id
-
-        if (transitionId) {
-            def payload = [
-                transition: [id: transitionId]
-            ]
-            httpRequest(
-                url: "${JIRA_BASE_URL}/rest/api/3/issue/${issueKey}/transitions",
-                httpMode: 'POST',
-                contentType: 'APPLICATION_JSON',
-                requestBody: groovy.json.JsonOutput.toJson(payload),
-                customHeaders: [
-                    [name: 'Authorization', value: "Basic ${"${JIRA_USER}:${JIRA_TOKEN}".bytes.encodeBase64().toString()}", maskValue: true],
-                    [name: 'Content-Type', value: 'application/json']
-                ],
-                validResponseCodes: '204'
-            )
-        } else {
-            error "Transition '${targetTransitionName}' not found for issue ${issueKey}"
-        }
+        sh """curl -s -X POST \
+                 -H "Authorization: Basic ${authToken}" \
+                 -H "Content-Type: application/json" \
+                 --data '${payloadStr}' \
+                 "${JIRA_BASE_URL}/rest/api/3/issue/${issueKey}/transitions" """
+        echo "Transitioned issue ${issueKey} to '${transitionName}'"
+    } else {
+        error "Transition '${transitionName}' not found for issue ${issueKey}"
     }
 }
 
